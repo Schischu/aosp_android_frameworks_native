@@ -3563,6 +3563,46 @@ status_t SurfaceFlinger::captureScreenImplCpuConsumerLocked(
 
     status_t result = NO_ERROR;
 
+
+        // Dirty workaround for black screenshots
+        const LayerVector& layers( mDrawingState.layersSortedByZ );
+        const size_t count = layers.size();
+        int visibleCount = 0;
+        int newMaxZ = maxLayerZ;
+        for (size_t i=0 ; i<count ; ++i) {
+            const sp<Layer>& layer(layers[i]);
+            const Layer::State& state(layer->getDrawingState());
+            const bool visible = (state.layerStack == hw->getLayerStack())
+                                && (state.z >= minLayerZ && state.z <= maxLayerZ)
+                                && (layer->isVisible());
+
+            if (visible) {
+                visibleCount++;
+                // break;
+            }
+
+            // Try to find a new max z based on z value.
+            //  - It appears that app windows have z-order divisible by 5.
+            //  - Higher non-app windows appear to be well above maxLayerZ + 100.
+            if (state.z % 5 == 0 &&
+                    state.z > maxLayerZ && state.z <= maxLayerZ + 100) {
+                newMaxZ = state.z;
+            }
+
+            if (state.z > maxLayerZ + 100)
+                break;
+        }
+
+        if (visibleCount == 0) {
+            // maxLayerZ = maxLayerZ + 10;
+
+            if (DEBUG_SCREENSHOTS) ALOGE("captureScreenImplCpuConsumerLocked: No visible layers" \
+                "in z-range %d to %d. Changed maxLayerZ to %d",
+                minLayerZ, maxLayerZ, newMaxZ);
+            maxLayerZ = newMaxZ;
+        }
+
+
     renderScreenImplLocked(
         hw, sourceCrop, reqWidth, reqHeight, minLayerZ, maxLayerZ, true,
         useIdentityTransform, rotation);
@@ -3582,6 +3622,14 @@ status_t SurfaceFlinger::captureScreenImplCpuConsumerLocked(
         result = NO_ERROR;
     } else {
         result = INVALID_OPERATION;
+    }
+
+    if (DEBUG_SCREENSHOTS) {
+        uint32_t* pixels = new uint32_t[reqWidth*reqHeight];
+        getRenderEngine().readPixels(0, 0, reqWidth, reqHeight, pixels);
+        checkScreenshot(reqWidth, reqHeight, reqWidth, pixels,
+                hw, minLayerZ, maxLayerZ);
+        delete [] pixels;
     }
 
     return result;
