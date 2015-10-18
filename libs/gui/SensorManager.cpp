@@ -94,6 +94,12 @@ SensorManager::SensorManager(const String16& opPackageName)
     assertStateLocked();
 }
 
+SensorManager::SensorManager()
+    : mSensorList(0), mOpPackageName(String16("")) {
+    // okay we're not locked here, but it's not needed during construction
+    assertStateLocked();
+}
+
 SensorManager::~SensorManager() {
     free(mSensorList);
 }
@@ -209,6 +215,12 @@ Sensor const* SensorManager::getDefaultSensor(int type)
     }
     return NULL;
 }
+
+#if 1
+sp<SensorEventQueue> SensorManager::createEventQueue() {
+    return createEventQueue(String8(""), 0);
+}
+#endif
 
 sp<SensorEventQueue> SensorManager::createEventQueue(String8 packageName, int mode) {
     sp<SensorEventQueue> queue;

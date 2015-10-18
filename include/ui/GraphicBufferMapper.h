@@ -42,20 +42,41 @@ public:
 
     status_t unregisterBuffer(buffer_handle_t handle);
 
+#if 1
+    status_t lock(buffer_handle_t handle,
+            int usage, const Rect& bounds, void** vaddr);
+#else
     status_t lock(buffer_handle_t handle,
             uint32_t usage, const Rect& bounds, void** vaddr);
+#endif
 
+#if 1
+    status_t lockYCbCr(buffer_handle_t handle,
+            int usage, const Rect& bounds, android_ycbcr *ycbcr);
+#else
     status_t lockYCbCr(buffer_handle_t handle,
             uint32_t usage, const Rect& bounds, android_ycbcr *ycbcr);
+#endif
 
     status_t unlock(buffer_handle_t handle);
 
+#if 1
+    status_t lockAsync(buffer_handle_t handle,
+            int usage, const Rect& bounds, void** vaddr, int fenceFd);
+#else
     status_t lockAsync(buffer_handle_t handle,
             uint32_t usage, const Rect& bounds, void** vaddr, int fenceFd);
+#endif
 
+#if 1
+    status_t lockAsyncYCbCr(buffer_handle_t handle,
+            int usage, const Rect& bounds, android_ycbcr *ycbcr,
+            int fenceFd);
+#else
     status_t lockAsyncYCbCr(buffer_handle_t handle,
             uint32_t usage, const Rect& bounds, android_ycbcr *ycbcr,
             int fenceFd);
+#endif
 
     status_t unlockAsync(buffer_handle_t handle, int *fenceFd);
 
