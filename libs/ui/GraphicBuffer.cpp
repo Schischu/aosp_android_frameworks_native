@@ -195,7 +195,7 @@ status_t GraphicBuffer::lock(uint32_t inUsage, const Rect& rect, void** vaddr)
                 width, height);
         return BAD_VALUE;
     }
-    status_t res = getBufferMapper().lock(handle, inUsage, rect, vaddr);
+    status_t res = getBufferMapper().lock(handle, static_cast<int>(inUsage), rect, vaddr);
     return res;
 }
 
@@ -216,7 +216,7 @@ status_t GraphicBuffer::lockYCbCr(uint32_t inUsage, const Rect& rect,
                 width, height);
         return BAD_VALUE;
     }
-    status_t res = getBufferMapper().lockYCbCr(handle, inUsage, rect, ycbcr);
+    status_t res = getBufferMapper().lockYCbCr(handle, static_cast<int>(inUsage), rect, ycbcr);
     return res;
 }
 
@@ -243,7 +243,7 @@ status_t GraphicBuffer::lockAsync(uint32_t inUsage, const Rect& rect,
                 width, height);
         return BAD_VALUE;
     }
-    status_t res = getBufferMapper().lockAsync(handle, inUsage, rect, vaddr,
+    status_t res = getBufferMapper().lockAsync(handle, static_cast<int>(inUsage), rect, vaddr,
             fenceFd);
     return res;
 }
@@ -266,7 +266,7 @@ status_t GraphicBuffer::lockAsyncYCbCr(uint32_t inUsage, const Rect& rect,
                 width, height);
         return BAD_VALUE;
     }
-    status_t res = getBufferMapper().lockAsyncYCbCr(handle, inUsage, rect,
+    status_t res = getBufferMapper().lockAsyncYCbCr(handle, static_cast<int>(inUsage), rect,
             ycbcr, fenceFd);
     return res;
 }
