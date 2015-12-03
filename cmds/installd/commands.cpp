@@ -858,6 +858,16 @@ static void run_dex2oat(int zip_fd, int oat_fd, const char* input_file_name,
         }
     }
 
+    char dex2oat_compiler_backend[PROPERTY_VALUE_MAX];
+    bool have_dex2oat_compiller_backend = false;
+    if (property_get("config.dex2oat-compiler-backend", prop_buf, "") > 0) {
+        if (strcmp(prop_buf, "Optimizing") == 0 || strcmp(prop_buf, "Quick") == 0) {
+            snprintf(dex2oat_compiler_backend, sizeof(dex2oat_compiler_backend),
+                "--compiler-backend=%s", prop_buf);
+            have_dex2oat_compiller_backend = true;
+        }
+    }
+
     if (have_dex2oat_Xms_flag) {
         sprintf(dex2oat_Xms_arg, "-Xms%s", dex2oat_Xms_flag);
     }
@@ -898,6 +908,7 @@ static void run_dex2oat(int zip_fd, int oat_fd, const char* input_file_name,
                      + (have_dex2oat_threads_flag ? 1 : 0)
                      + (have_dex2oat_swap_fd ? 1 : 0)
                      + (have_dex2oat_relocation_skip_flag ? 2 : 0)
+                     + (have_dex2oat_compiller_backend ? 1 : 0)
                      + (generate_debug_info ? 1 : 0)
                      + (debuggable ? 1 : 0)
                      + dex2oat_flags_count];
@@ -936,6 +947,9 @@ static void run_dex2oat(int zip_fd, int oat_fd, const char* input_file_name,
     }
     if (have_dex2oat_swap_fd) {
         argv[i++] = dex2oat_swap_fd;
+    }
+    if (have_dex2oat_compiller_backend) {
+        argv[i++] = dex2oat_compiler_backend;
     }
     if (generate_debug_info) {
         argv[i++] = "--generate-debug-info";
