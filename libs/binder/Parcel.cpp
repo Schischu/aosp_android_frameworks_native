@@ -869,6 +869,11 @@ status_t Parcel::writeString16(const char16_t* str, size_t len)
     return err;
 }
 
+status_t Parcel::writeString16(const unsigned short* str, size_t len)
+{
+    return writeString16((char16_t*)str, len);
+}
+
 status_t Parcel::writeStrongBinder(const sp<IBinder>& val)
 {
     return flatten_binder(ProcessState::self(), val, this);
