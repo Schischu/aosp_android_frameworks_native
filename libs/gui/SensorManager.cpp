@@ -39,6 +39,8 @@ namespace android {
 android::Mutex android::SensorManager::sLock;
 std::map<String16, SensorManager*> android::SensorManager::sPackageInstances;
 
+ANDROID_SINGLETON_STATIC_INSTANCE(SensorManager)
+
 SensorManager& SensorManager::getInstanceForPackage(const String16& packageName) {
     Mutex::Autolock _l(sLock);
     SensorManager* sensorManager;
