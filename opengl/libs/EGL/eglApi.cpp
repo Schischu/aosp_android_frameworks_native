@@ -331,11 +331,21 @@ EGLBoolean eglGetConfigs(   EGLDisplay dpy,
     return res;
 }
 
+//#define HAVE_DUMP_EGLCONFIG
+#define HAVE_EGLCONFIG_NO_ES3
+
+#define EGL_OPENGL_ES3_BIT (0x40)
+
 EGLBoolean eglChooseConfig( EGLDisplay dpy, const EGLint *attrib_list,
                             EGLConfig *configs, EGLint config_size,
                             EGLint *num_config)
 {
     clearError();
+
+#ifdef HAVE_DUMP_EGLCONFIG
+    ALOGE("####################################################");
+    ALOGE("eglChooseConfig");
+#endif /*HAVE_DUMP_EGLCONFIG*/
 
     const egl_display_ptr dp = validate_display(dpy);
     if (!dp) return EGL_FALSE;
@@ -350,28 +360,55 @@ EGLBoolean eglChooseConfig( EGLDisplay dpy, const EGLint *attrib_list,
     egl_connection_t* const cnx = &gEGLImpl;
     if (cnx->dso) {
         if (attrib_list) {
+            size_t attribCount = 0;
+            EGLint attrib = attrib_list[0];
+
+            while (attrib != EGL_NONE) {
+                attrib = attrib_list[attribCount];
+                attribCount++;
+            }
+
+            EGLint legacyAttribs[attribCount + 1];
+            memcpy(legacyAttribs, attrib_list, attribCount * sizeof(EGLint));
+            legacyAttribs[attribCount] = EGL_NONE;
+
+            for (size_t i = 0; legacyAttribs[i] != EGL_NONE; i+=2) {
+                if (legacyAttribs[i] == EGL_RENDERABLE_TYPE &&
+                    (legacyAttribs[i+1] & EGL_OPENGL_ES3_BIT) == EGL_OPENGL_ES3_BIT) {
+                    legacyAttribs[i+1] = EGL_OPENGL_ES2_BIT;
+                }
+            }
+
             char value[PROPERTY_VALUE_MAX];
             property_get("debug.egl.force_msaa", value, "false");
+#ifdef HAVE_DUMP_EGLCONFIG
+            ALOGE("eglChooseConfig: debug.egl.force_msaa: %s", value);
+#endif /*HAVE_DUMP_EGLCONFIG*/
 
-            if (!strcmp(value, "true")) {
-                size_t attribCount = 0;
-                EGLint attrib = attrib_list[0];
+            /*Also check for 1 for legacy purposes. Older ROMs have set it to 1 instead of true by default which is wrong*/
+            if (!strcmp(value, "true") || value[0] == '1') {
+                attribCount = 0;
+                attrib = legacyAttribs[0];
 
                 // Only enable MSAA if the context is OpenGL ES 2.0 and
                 // if no caveat is requested
                 const EGLint *attribRendererable = NULL;
                 const EGLint *attribCaveat = NULL;
 
+#ifdef HAVE_DUMP_EGLCONFIG
+                ALOGE("eglChooseConfig: debug.egl.force_msaa: TRUE");
+#endif /*HAVE_DUMP_EGLCONFIG*/
+
                 // Count the number of attributes and look for
                 // EGL_RENDERABLE_TYPE and EGL_CONFIG_CAVEAT
                 while (attrib != EGL_NONE) {
-                    attrib = attrib_list[attribCount];
+                    attrib = legacyAttribs[attribCount];
                     switch (attrib) {
                         case EGL_RENDERABLE_TYPE:
-                            attribRendererable = &attrib_list[attribCount];
+                            attribRendererable = &legacyAttribs[attribCount];
                             break;
                         case EGL_CONFIG_CAVEAT:
-                            attribCaveat = &attrib_list[attribCount];
+                            attribCaveat = &legacyAttribs[attribCount];
                             break;
                     }
                     attribCount++;
@@ -382,28 +419,46 @@ EGLBoolean eglChooseConfig( EGLDisplay dpy, const EGLint *attrib_list,
 
                     // Insert 2 extra attributes to force-enable MSAA 4x
                     EGLint aaAttribs[attribCount + 4];
-                    aaAttribs[0] = EGL_SAMPLE_BUFFERS;
+                    aaAttribs[0] = EGL_SAMPLE_BUFFERS; //12338
                     aaAttribs[1] = 1;
-                    aaAttribs[2] = EGL_SAMPLES;
+                    aaAttribs[2] = EGL_SAMPLES; //12338
                     aaAttribs[3] = 4;
 
-                    memcpy(&aaAttribs[4], attrib_list, attribCount * sizeof(EGLint));
+                    memcpy(&aaAttribs[4], legacyAttribs, attribCount * sizeof(EGLint));
+
+#ifdef HAVE_DUMP_EGLCONFIG
+                    for (size_t i = 0; aaAttribs[i] != EGL_NONE; i+=2) {
+                        ALOGE("eglChooseConfig: AA [%u] %u = %u", i/2, aaAttribs[i], aaAttribs[i+1]);
+                    }
+#endif /*HAVE_DUMP_EGLCONFIG*/
 
                     EGLint numConfigAA;
                     EGLBoolean resAA = cnx->egl.eglChooseConfig(
                             dp->disp.dpy, aaAttribs, configs, config_size, &numConfigAA);
 
                     if (resAA == EGL_TRUE && numConfigAA > 0) {
-                        ALOGD("Enabling MSAA 4x");
+                        ALOGE("Enabling MSAA 4x");
                         *num_config = numConfigAA;
                         return resAA;
                     }
                 }
             }
+
+#ifdef HAVE_DUMP_EGLCONFIG
+            for (size_t i = 0; legacyAttribs[i] != EGL_NONE; i+=2) {
+                ALOGE("eglChooseConfig: [%u] %u = %u", i/2, legacyAttribs[i], legacyAttribs[i+1]);
+            }
+#endif /*HAVE_DUMP_EGLCONFIG*/
+
+            res = cnx->egl.eglChooseConfig(
+                    dp->disp.dpy, legacyAttribs, configs, config_size, num_config);
+        }
+        else
+        {
+            res = cnx->egl.eglChooseConfig(
+                    dp->disp.dpy, NULL, configs, config_size, num_config);
         }
 
-        res = cnx->egl.eglChooseConfig(
-                dp->disp.dpy, attrib_list, configs, config_size, num_config);
     }
     return res;
 }
