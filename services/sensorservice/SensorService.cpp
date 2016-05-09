@@ -146,10 +146,16 @@ void SensorService::onFirstRef()
 
                 aSensor = registerVirtualSensor( new OrientationSensor() );
                 if (virtualSensorsNeeds & (1<<SENSOR_TYPE_ROTATION_VECTOR)) {
+#if 0
                     if (orientationIndex == -1) {
                         // some sensor HALs don't provide an orientation sensor.
                         mUserSensorList.add(aSensor);
                     }
+#else
+                    // if we are doing our own rotation-vector, also add
+                    // the orientation sensor and remove the HAL provided one.
+                    mUserSensorList.replaceAt(aSensor, orientationIndex);
+#endif
                 }
 
                 // virtual debugging sensors are not added to mUserSensorList
@@ -924,7 +930,9 @@ status_t SensorService::enable(const sp<SensorEventConnection>& connection,
             sensor->getSensor().getReportingMode() != AREPORTING_MODE_ONE_SHOT &&
             sensor->getSensor().getReportingMode() != AREPORTING_MODE_ON_CHANGE &&
             rec->getNumConnections() > 1) {
+#if 0
         if (device.getHalDeviceVersion() >= SENSORS_DEVICE_API_VERSION_1_1) {
+#endif
             connection->setFirstFlushPending(handle, true);
             status_t err_flush = sensor->flush(connection.get(), handle);
             // Flush may return error if the underlying h/w sensor uses an older HAL.
@@ -933,7 +941,9 @@ status_t SensorService::enable(const sp<SensorEventConnection>& connection,
             } else {
                 connection->setFirstFlushPending(handle, false);
             }
+#if 0
         }
+#endif
     }
 
     if (err == NO_ERROR) {
@@ -958,10 +968,12 @@ status_t SensorService::enable(const sp<SensorEventConnection>& connection,
         mNextSensorRegIndex = (mNextSensorRegIndex + 1) % SENSOR_REGISTRATIONS_BUF_SIZE;
     }
 
+#if 0
     if (device.getHalDeviceVersion() < SENSORS_DEVICE_API_VERSION_1_1) {
         // Pre-1.1 sensor HALs had no flush method, and relied on setDelay at init
         sensor->setDelay(connection.get(), handle, samplingPeriodNs);
     }
+#endif
 
     if (err != NO_ERROR) {
         // batch/activate has failed, reset our state.
