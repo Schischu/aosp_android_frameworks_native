@@ -59,6 +59,7 @@ BufferQueueCore::BufferQueueCore(const sp<IGraphicBufferAlloc>& allocator) :
     mConsumerListener(),
     mConsumerUsageBits(0),
     mConnectedApi(NO_CONNECTED_API),
+    mLinkedToDeath(),
     mConnectedProducerListener(),
     mSlots(),
     mQueue(),
@@ -89,6 +90,7 @@ BufferQueueCore::BufferQueueCore(const sp<IGraphicBufferAlloc>& allocator) :
     mSharedBufferSlot(INVALID_BUFFER_SLOT),
     mSharedBufferCache(Rect::INVALID_RECT, 0, NATIVE_WINDOW_SCALING_MODE_FREEZE,
             HAL_DATASPACE_UNKNOWN),
+    mLastQueuedSlot(INVALID_BUFFER_SLOT),
     mUniqueId(getUniqueId())
 {
     if (allocator == NULL) {
@@ -240,6 +242,16 @@ void BufferQueueCore::freeAllBuffersLocked() {
     for (auto& b : mQueue) {
         b.mIsStale = true;
     }
+
+    VALIDATE_CONSISTENCY();
+}
+
+void BufferQueueCore::discardFreeBuffersLocked() {
+    for (int s : mFreeBuffers) {
+        mFreeSlots.insert(s);
+        clearBufferSlotLocked(s);
+    }
+    mFreeBuffers.clear();
 
     VALIDATE_CONSISTENCY();
 }

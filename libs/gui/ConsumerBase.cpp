@@ -235,6 +235,25 @@ status_t ConsumerBase::setDefaultBufferDataSpace(
     return mConsumer->setDefaultBufferDataSpace(defaultDataSpace);
 }
 
+status_t ConsumerBase::getOccupancyHistory(bool forceFlush,
+        std::vector<OccupancyTracker::Segment>* outHistory) {
+    Mutex::Autolock _l(mMutex);
+    if (mAbandoned) {
+        CB_LOGE("getOccupancyHistory: ConsumerBase is abandoned!");
+        return NO_INIT;
+    }
+    return mConsumer->getOccupancyHistory(forceFlush, outHistory);
+}
+
+status_t ConsumerBase::discardFreeBuffers() {
+    Mutex::Autolock _l(mMutex);
+    if (mAbandoned) {
+        CB_LOGE("discardFreeBuffers: ConsumerBase is abandoned!");
+        return NO_INIT;
+    }
+    return mConsumer->discardFreeBuffers();
+}
+
 void ConsumerBase::dump(String8& result) const {
     dump(result, "");
 }
@@ -295,10 +314,23 @@ status_t ConsumerBase::addReleaseFenceLocked(int slot,
 
     if (!mSlots[slot].mFence.get()) {
         mSlots[slot].mFence = fence;
+        return OK;
+    }
+
+    auto signaled = mSlots[slot].mFence->hasSignaled();
+
+    if (!signaled) {
+        CB_LOGE("fence has invalid state");
+        return BAD_VALUE;
+    }
+
+    if (*signaled) {
+        mSlots[slot].mFence = fence;
     } else {
+        char fenceName[32] = {};
+        snprintf(fenceName, 32, "%.28s:%d", mName.string(), slot);
         sp<Fence> mergedFence = Fence::merge(
-                String8::format("%.28s:%d", mName.string(), slot),
-                mSlots[slot].mFence, fence);
+                fenceName, mSlots[slot].mFence, fence);
         if (!mergedFence.get()) {
             CB_LOGE("failed to merge release fences");
             // synchronization is broken, the best we can do is hope fences

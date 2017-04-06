@@ -34,7 +34,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <android-base/file.h>
 #include <android-base/stringprintf.h>
+#include <android-base/strings.h>
 #include <cutils/properties.h>
 
 #include "private/android_filesystem_config.h"
@@ -54,14 +56,14 @@ using android::base::StringPrintf;
 static char cmdline_buf[16384] = "(unknown)";
 static const char *dump_traces_path = NULL;
 
-// TODO: should be part of dumpstate object
+// TODO: variables below should be part of dumpstate object
 static unsigned long id;
 static char build_type[PROPERTY_VALUE_MAX];
 static time_t now;
 static std::unique_ptr<ZipWriter> zip_writer;
 static std::set<std::string> mount_points;
 void add_mountinfo();
-static int control_socket_fd;
+int control_socket_fd = -1;
 /* suffix of the bugreport files - it's typically the date (when invoked with -d),
  * although it could be changed by the user using a system property */
 static std::string suffix;
@@ -69,10 +71,12 @@ static std::string suffix;
 #define PSTORE_LAST_KMSG "/sys/fs/pstore/console-ramoops"
 #define ALT_PSTORE_LAST_KMSG "/sys/fs/pstore/console-ramoops-0"
 
-#define RAFT_DIR "/data/misc/raft/"
+#define RAFT_DIR "/data/misc/raft"
 #define RECOVERY_DIR "/cache/recovery"
 #define RECOVERY_DATA_DIR "/data/misc/recovery"
 #define LOGPERSIST_DATA_DIR "/data/misc/logd"
+#define PROFILE_DATA_DIR_CUR "/data/misc/profiles/cur"
+#define PROFILE_DATA_DIR_REF "/data/misc/profiles/ref"
 #define TOMBSTONE_DIR "/data/tombstones"
 #define TOMBSTONE_FILE_PREFIX TOMBSTONE_DIR "/tombstone_"
 /* Can accomodate a tombstone number up to 9999. */
@@ -147,7 +151,7 @@ void do_mountinfo(int pid, const char *name) {
 }
 
 void add_mountinfo() {
-    if (!zip_writer) return;
+    if (!is_zipping()) return;
     const char *title = "MOUNT INFO";
     mount_points.clear();
     DurationReporter duration_reporter(title, NULL);
@@ -177,9 +181,139 @@ static void dump_dev_files(const char *title, const char *driverpath, const char
     closedir(d);
 }
 
-static void dump_systrace() {
+// return pid of a userspace process. If not found or error, return 0.
+static unsigned int pid_of_process(const char* ps_name) {
+    DIR *proc_dir;
+    struct dirent *ps;
+    unsigned int pid;
+    std::string cmdline;
+
+    if (!(proc_dir = opendir("/proc"))) {
+        MYLOGE("Can't open /proc\n");
+        return 0;
+    }
+
+    while ((ps = readdir(proc_dir))) {
+        if (!(pid = atoi(ps->d_name))) {
+            continue;
+        }
+        android::base::ReadFileToString("/proc/"
+                + std::string(ps->d_name) + "/cmdline", &cmdline);
+        if (cmdline.find(ps_name) == std::string::npos) {
+            continue;
+        } else {
+            closedir(proc_dir);
+            return pid;
+        }
+    }
+    closedir(proc_dir);
+    return 0;
+}
+
+// dump anrd's trace and add to the zip file.
+// 1. check if anrd is running on this device.
+// 2. send a SIGUSR1 to its pid which will dump anrd's trace.
+// 3. wait until the trace generation completes and add to the zip file.
+static bool dump_anrd_trace() {
+    unsigned int pid;
+    char buf[50], path[PATH_MAX];
+    struct dirent *trace;
+    struct stat st;
+    DIR *trace_dir;
+    int retry = 5;
+    long max_ctime = 0, old_mtime;
+    long long cur_size = 0;
+    const char *trace_path = "/data/misc/anrd/";
+
     if (!zip_writer) {
-        MYLOGD("Not dumping systrace because zip_writer is not set\n");
+        MYLOGE("Not dumping anrd trace because zip_writer is not set\n");
+        return false;
+    }
+
+    // find anrd's pid if it is running.
+    pid = pid_of_process("/system/xbin/anrd");
+
+    if (pid > 0) {
+        if (stat(trace_path, &st) == 0) {
+            old_mtime = st.st_mtime;
+        } else {
+            MYLOGE("Failed to find: %s\n", trace_path);
+            return false;
+        }
+
+        // send SIGUSR1 to the anrd to generate a trace.
+        sprintf(buf, "%u", pid);
+        if (run_command("ANRD_DUMP", 1, "kill", "-SIGUSR1", buf, NULL)) {
+            MYLOGE("anrd signal timed out. Please manually collect trace\n");
+            return false;
+        }
+
+        while (retry-- > 0 && old_mtime == st.st_mtime) {
+            sleep(1);
+            stat(trace_path, &st);
+        }
+
+        if (retry < 0 && old_mtime == st.st_mtime) {
+            MYLOGE("Failed to stat %s or trace creation timeout\n", trace_path);
+            return false;
+        }
+
+        // identify the trace file by its creation time.
+        if (!(trace_dir = opendir(trace_path))) {
+            MYLOGE("Can't open trace file under %s\n", trace_path);
+        }
+        while ((trace = readdir(trace_dir))) {
+            if (strcmp(trace->d_name, ".") == 0
+                    || strcmp(trace->d_name, "..") == 0) {
+                continue;
+            }
+            sprintf(path, "%s%s", trace_path, trace->d_name);
+            if (stat(path, &st) == 0) {
+                if (st.st_ctime > max_ctime) {
+                    max_ctime = st.st_ctime;
+                    sprintf(buf, "%s", trace->d_name);
+                }
+            }
+        }
+        closedir(trace_dir);
+
+        // Wait until the dump completes by checking the size of the trace.
+        if (max_ctime > 0) {
+            sprintf(path, "%s%s", trace_path, buf);
+            while(true) {
+                sleep(1);
+                if (stat(path, &st) == 0) {
+                    if (st.st_size == cur_size) {
+                        break;
+                    } else if (st.st_size > cur_size) {
+                        cur_size = st.st_size;
+                    } else {
+                        return false;
+                    }
+                } else {
+                    MYLOGE("Cant stat() %s anymore\n", path);
+                    return false;
+                }
+            }
+            // Add to the zip file.
+            if (!add_zip_entry("anrd_trace.txt", path)) {
+                MYLOGE("Unable to add anrd_trace file %s to zip file\n", path);
+            } else {
+                if (remove(path)) {
+                    MYLOGE("Error removing anrd_trace file %s: %s", path, strerror(errno));
+                }
+                return true;
+            }
+        } else {
+            MYLOGE("Can't stats any trace file under %s\n", trace_path);
+        }
+    }
+    return false;
+}
+
+static void dump_systrace() {
+    if (!is_zipping()) {
+        MYLOGD("Not dumping systrace because dumpstate is not zipping\n");
         return;
     }
     std::string systrace_path = bugreport_dir + "/systrace-" + suffix + ".txt";
@@ -214,6 +348,117 @@ static void dump_systrace() {
     } else {
         if (remove(systrace_path.c_str())) {
             MYLOGE("Error removing systrace file %s: %s", systrace_path.c_str(), strerror(errno));
+        }
+    }
+}
+
+static void dump_raft() {
+    if (is_user_build()) {
+        return;
+    }
+
+    std::string raft_log_path = bugreport_dir + "/raft_log.txt";
+    if (raft_log_path.empty()) {
+        MYLOGD("raft_log_path is empty\n");
+        return;
+    }
+
+    struct stat s;
+    if (stat(RAFT_DIR, &s) != 0 || !S_ISDIR(s.st_mode)) {
+        MYLOGD("%s does not exist or is not a directory\n", RAFT_DIR);
+        return;
+    }
+
+    if (!is_zipping()) {
+        // Write compressed and encoded raft logs to stdout if not zip_writer.
+        run_command("RAFT LOGS", 600, "logcompressor", "-r", RAFT_DIR, NULL);
+        return;
+    }
+
+    run_command("RAFT LOGS", 600, "logcompressor", "-n", "-r", RAFT_DIR,
+            "-o", raft_log_path.c_str(), NULL);
+    if (!add_zip_entry("raft_log.txt", raft_log_path)) {
+        MYLOGE("Unable to add raft log %s to zip file\n", raft_log_path.c_str());
+    } else {
+        if (remove(raft_log_path.c_str())) {
+            MYLOGE("Error removing raft file %s: %s\n", raft_log_path.c_str(), strerror(errno));
+        }
+    }
+}
+
+/**
+ * Finds the last modified file in the directory dir whose name starts with file_prefix
+ * Function returns empty string when it does not find a file
+ */
+static std::string get_last_modified_file_matching_prefix(const std::string& dir,
+                                                          const std::string& file_prefix) {
+    std::unique_ptr<DIR, decltype(&closedir)> d(opendir(dir.c_str()), closedir);
+    if (d == nullptr) {
+        MYLOGD("Error %d opening %s\n", errno, dir.c_str());
+        return "";
+    }
+
+    // Find the newest file matching the file_prefix in dir
+    struct dirent *de;
+    time_t last_modified = 0;
+    std::string last_modified_file = "";
+    struct stat s;
+
+    while ((de = readdir(d.get()))) {
+        std::string file = std::string(de->d_name);
+        if (!file_prefix.empty()) {
+            if (!android::base::StartsWith(file, file_prefix.c_str())) continue;
+        }
+        file = dir + "/" + file;
+        int ret = stat(file.c_str(), &s);
+
+        if ((ret == 0) && (s.st_mtime > last_modified)) {
+            last_modified_file = file;
+            last_modified = s.st_mtime;
+        }
+    }
+
+    return last_modified_file;
+}
+
+void dump_modem_logs() {
+    DurationReporter duration_reporter("dump_modem_logs");
+    if (is_user_build()) {
+        return;
+    }
+
+    if (!is_zipping()) {
+        MYLOGD("Not dumping modem logs. dumpstate is not generating a zipping bugreport\n");
+        return;
+    }
+
+    char property[PROPERTY_VALUE_MAX];
+    property_get("ro.radio.log_prefix", property, "");
+    std::string file_prefix = std::string(property);
+    if(file_prefix.empty()) {
+        MYLOGD("No modem log : file_prefix is empty\n");
+        return;
+    }
+
+    MYLOGD("dump_modem_logs: directory is %s and file_prefix is %s\n",
+           bugreport_dir.c_str(), file_prefix.c_str());
+
+    std::string modem_log_file =
+        get_last_modified_file_matching_prefix(bugreport_dir, file_prefix);
+
+    struct stat s;
+    if (modem_log_file.empty() || stat(modem_log_file.c_str(), &s) != 0) {
+        MYLOGD("Modem log %s does not exist\n", modem_log_file.c_str());
+        return;
+    }
+
+    std::string filename = basename(modem_log_file.c_str());
+    if (!add_zip_entry(filename, modem_log_file)) {
+        MYLOGE("Unable to add modem log %s to zip file\n", modem_log_file.c_str());
+    } else {
+        MYLOGD("Modem Log %s is added to zip\n", modem_log_file.c_str());
+        if (remove(modem_log_file.c_str())) {
+            MYLOGE("Error removing modem log %s\n", modem_log_file.c_str());
         }
     }
 }
@@ -506,7 +751,7 @@ static void print_header(std::string version) {
     property_get("ro.build.display.id", build, "(unknown)");
     property_get("ro.build.fingerprint", fingerprint, "(unknown)");
     property_get("ro.build.type", build_type, "(unknown)");
-    property_get("ro.baseband", radio, "(unknown)");
+    property_get("gsm.version.baseband", radio, "(unknown)");
     property_get("ro.bootloader", bootloader, "(unknown)");
     property_get("gsm.operator.alpha", network, "(unknown)");
     strftime(date, sizeof(date), "%Y-%m-%d %H:%M:%S", localtime(&now));
@@ -530,18 +775,39 @@ static void print_header(std::string version) {
     printf("\n");
 }
 
+// List of file extensions that can cause a zip file attachment to be rejected by some email
+// service providers.
+static const std::set<std::string> PROBLEMATIC_FILE_EXTENSIONS = {
+      ".ade", ".adp", ".bat", ".chm", ".cmd", ".com", ".cpl", ".exe", ".hta", ".ins", ".isp",
+      ".jar", ".jse", ".lib", ".lnk", ".mde", ".msc", ".msp", ".mst", ".pif", ".scr", ".sct",
+      ".shb", ".sys", ".vb",  ".vbe", ".vbs", ".vxd", ".wsc", ".wsf", ".wsh"
+};
+
 bool add_zip_entry_from_fd(const std::string& entry_name, int fd) {
-    if (!zip_writer) {
-        MYLOGD("Not adding zip entry %s from fd because zip_writer is not set\n",
+    if (!is_zipping()) {
+        MYLOGD("Not adding entry %s from fd because dumpstate is not zipping\n",
                 entry_name.c_str());
         return false;
     }
+    std::string valid_name = entry_name;
+
+    // Rename extension if necessary.
+    size_t idx = entry_name.rfind(".");
+    if (idx != std::string::npos) {
+        std::string extension = entry_name.substr(idx);
+        std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
+        if (PROBLEMATIC_FILE_EXTENSIONS.count(extension) != 0) {
+            valid_name = entry_name + ".renamed";
+            MYLOGI("Renaming entry %s to %s\n", entry_name.c_str(), valid_name.c_str());
+        }
+    }
+
     // Logging statement  below is useful to time how long each entry takes, but it's too verbose.
     // MYLOGD("Adding zip entry %s\n", entry_name.c_str());
-    int32_t err = zip_writer->StartEntryWithTime(entry_name.c_str(),
+    int32_t err = zip_writer->StartEntryWithTime(valid_name.c_str(),
             ZipWriter::kCompress, get_mtime(fd, now));
     if (err) {
-        MYLOGE("zip_writer->StartEntryWithTime(%s): %s\n", entry_name.c_str(),
+        MYLOGE("zip_writer->StartEntryWithTime(%s): %s\n", valid_name.c_str(),
                 ZipWriter::ErrorCodeString(err));
         return false;
     }
@@ -586,9 +852,10 @@ static int _add_file_from_fd(const char *title, const char *path, int fd) {
     return add_zip_entry_from_fd(ZIP_ROOT_DIR + path, fd) ? 0 : 1;
 }
 
+// TODO: move to util.cpp
 void add_dir(const char *dir, bool recursive) {
-    if (!zip_writer) {
-        MYLOGD("Not adding dir %s because zip_writer is not set\n", dir);
+    if (!is_zipping()) {
+        MYLOGD("Not adding dir %s because dumpstate is not zipping\n", dir);
         return;
     }
     MYLOGD("Adding dir %s (recursive: %d)\n", dir, recursive);
@@ -596,10 +863,14 @@ void add_dir(const char *dir, bool recursive) {
     dump_files(NULL, dir, recursive ? skip_none : is_dir, _add_file_from_fd);
 }
 
+bool is_zipping() {
+    return zip_writer != nullptr;
+}
+
 /* adds a text entry entry to the existing zip file. */
 static bool add_text_zip_entry(const std::string& entry_name, const std::string& content) {
-    if (!zip_writer) {
-        MYLOGD("Not adding text zip entry %s because zip_writer is not set\n", entry_name.c_str());
+    if (!is_zipping()) {
+        MYLOGD("Not adding text entry %s because dumpstate is not zipping\n", entry_name.c_str());
         return false;
     }
     MYLOGD("Adding zip text entry %s\n", entry_name.c_str());
@@ -629,15 +900,71 @@ static bool add_text_zip_entry(const std::string& entry_name, const std::string&
 static void dump_iptables() {
     run_command("IPTABLES", 10, "iptables", "-L", "-nvx", NULL);
     run_command("IP6TABLES", 10, "ip6tables", "-L", "-nvx", NULL);
-    run_command("IPTABLE NAT", 10, "iptables", "-t", "nat", "-L", "-nvx", NULL);
+    run_command("IPTABLES NAT", 10, "iptables", "-t", "nat", "-L", "-nvx", NULL);
     /* no ip6 nat */
-    run_command("IPTABLE RAW", 10, "iptables", "-t", "raw", "-L", "-nvx", NULL);
-    run_command("IP6TABLE RAW", 10, "ip6tables", "-t", "raw", "-L", "-nvx", NULL);
+    run_command("IPTABLES MANGLE", 10, "iptables", "-t", "mangle", "-L", "-nvx", NULL);
+    run_command("IP6TABLES MANGLE", 10, "ip6tables", "-t", "mangle", "-L", "-nvx", NULL);
+    run_command("IPTABLES RAW", 10, "iptables", "-t", "raw", "-L", "-nvx", NULL);
+    run_command("IP6TABLES RAW", 10, "ip6tables", "-t", "raw", "-L", "-nvx", NULL);
+}
+
+static void do_kmsg() {
+    struct stat st;
+    if (!stat(PSTORE_LAST_KMSG, &st)) {
+        /* Also TODO: Make console-ramoops CAP_SYSLOG protected. */
+        dump_file("LAST KMSG", PSTORE_LAST_KMSG);
+    } else if (!stat(ALT_PSTORE_LAST_KMSG, &st)) {
+        dump_file("LAST KMSG", ALT_PSTORE_LAST_KMSG);
+    } else {
+        /* TODO: Make last_kmsg CAP_SYSLOG protected. b/5555691 */
+        dump_file("LAST KMSG", "/proc/last_kmsg");
+    }
+}
+
+static void do_logcat() {
+    unsigned long timeout;
+    // dump_file("EVENT LOG TAGS", "/etc/event-log-tags");
+    // calculate timeout
+    timeout = logcat_timeout("main") + logcat_timeout("system") + logcat_timeout("crash");
+    if (timeout < 20000) {
+        timeout = 20000;
+    }
+    run_command("SYSTEM LOG", timeout / 1000, "logcat", "-v", "threadtime",
+                                                        "-v", "printable",
+                                                        "-d",
+                                                        "*:v", NULL);
+    timeout = logcat_timeout("events");
+    if (timeout < 20000) {
+        timeout = 20000;
+    }
+    run_command("EVENT LOG", timeout / 1000, "logcat", "-b", "events",
+                                                       "-v", "threadtime",
+                                                       "-v", "printable",
+                                                       "-d",
+                                                       "*:v", NULL);
+    timeout = logcat_timeout("radio");
+    if (timeout < 20000) {
+        timeout = 20000;
+    }
+    run_command("RADIO LOG", timeout / 1000, "logcat", "-b", "radio",
+                                                       "-v", "threadtime",
+                                                       "-v", "printable",
+                                                       "-d",
+                                                       "*:v", NULL);
+
+    run_command("LOG STATISTICS", 10, "logcat", "-b", "all", "-S", NULL);
+
+    /* kernels must set CONFIG_PSTORE_PMSG, slice up pstore with device tree */
+    run_command("LAST LOGCAT", 10, "logcat", "-L",
+                                             "-b", "all",
+                                             "-v", "threadtime",
+                                             "-v", "printable",
+                                             "-d",
+                                             "*:v", NULL);
 }
 
 static void dumpstate(const std::string& screenshot_path, const std::string& version) {
     DurationReporter duration_reporter("DUMPSTATE");
-    unsigned long timeout;
 
     dump_dev_files("TRUSTY VERSION", "/sys/bus/platform/drivers/trusty", "trusty_version");
     run_command("UPTIME", 10, "uptime", NULL);
@@ -672,44 +999,16 @@ static void dumpstate(const std::string& screenshot_path, const std::string& ver
     for_each_tid(show_wchan, "BLOCKED PROCESS WAIT-CHANNELS");
     for_each_pid(show_showtime, "PROCESS TIMES (pid cmd user system iowait+percentage)");
 
+    /* Dump Bluetooth HCI logs */
+    add_dir("/data/misc/bluetooth/logs", true);
+
     if (!screenshot_path.empty()) {
         MYLOGI("taking late screenshot\n");
         take_screenshot(screenshot_path);
         MYLOGI("wrote screenshot: %s\n", screenshot_path.c_str());
     }
 
-    // dump_file("EVENT LOG TAGS", "/etc/event-log-tags");
-    // calculate timeout
-    timeout = logcat_timeout("main") + logcat_timeout("system") + logcat_timeout("crash");
-    if (timeout < 20000) {
-        timeout = 20000;
-    }
-    run_command("SYSTEM LOG", timeout / 1000, "logcat", "-v", "threadtime",
-                                                        "-v", "printable",
-                                                        "-d",
-                                                        "*:v", NULL);
-    timeout = logcat_timeout("events");
-    if (timeout < 20000) {
-        timeout = 20000;
-    }
-    run_command("EVENT LOG", timeout / 1000, "logcat", "-b", "events",
-                                                       "-v", "threadtime",
-                                                       "-v", "printable",
-                                                       "-d",
-                                                       "*:v", NULL);
-    timeout = logcat_timeout("radio");
-    if (timeout < 20000) {
-        timeout = 20000;
-    }
-    run_command("RADIO LOG", timeout / 1000, "logcat", "-b", "radio",
-                                                       "-v", "threadtime",
-                                                       "-v", "printable",
-                                                       "-d",
-                                                       "*:v", NULL);
-
-    run_command("LOG STATISTICS", 10, "logcat", "-b", "all", "-S", NULL);
-
-    run_command("RAFT LOGS", 600, SU_PATH, "root", "logcompressor", "-r", RAFT_DIR, NULL);
+    do_logcat();
 
     /* show the traces we collected in main(), if that was done */
     if (dump_traces_path != NULL) {
@@ -777,23 +1076,7 @@ static void dumpstate(const std::string& screenshot_path, const std::string& ver
     dump_file("QTAGUID CTRL INFO", "/proc/net/xt_qtaguid/ctrl");
     dump_file("QTAGUID STATS INFO", "/proc/net/xt_qtaguid/stats");
 
-    if (!stat(PSTORE_LAST_KMSG, &st)) {
-        /* Also TODO: Make console-ramoops CAP_SYSLOG protected. */
-        dump_file("LAST KMSG", PSTORE_LAST_KMSG);
-    } else if (!stat(ALT_PSTORE_LAST_KMSG, &st)) {
-        dump_file("LAST KMSG", ALT_PSTORE_LAST_KMSG);
-    } else {
-        /* TODO: Make last_kmsg CAP_SYSLOG protected. b/5555691 */
-        dump_file("LAST KMSG", "/proc/last_kmsg");
-    }
-
-    /* kernels must set CONFIG_PSTORE_PMSG, slice up pstore with device tree */
-    run_command("LAST LOGCAT", 10, "logcat", "-L",
-                                             "-b", "all",
-                                             "-v", "threadtime",
-                                             "-v", "printable",
-                                             "-d",
-                                             "*:v", NULL);
+    do_kmsg();
 
     /* The following have a tendency to get wedged when wifi drivers/fw goes belly-up. */
 
@@ -924,8 +1207,12 @@ static void dumpstate(const std::string& screenshot_path, const std::string& ver
     printf("== Running Application Providers\n");
     printf("========================================================\n");
 
-    run_command("APP SERVICES", 30, "dumpsys", "-t", "30", "activity", "provider", "all", NULL);
+    run_command("APP PROVIDERS", 30, "dumpsys", "-t", "30", "activity", "provider", "all", NULL);
 
+    // dump_modem_logs adds the modem logs if available to the bugreport.
+    // Do this at the end to allow for sufficient time for the modem logs to be
+    // collected.
+    dump_modem_logs();
 
     printf("========================================================\n");
     printf("== Final progress (pid %d): %d/%d (originally %d)\n",
@@ -937,14 +1224,15 @@ static void dumpstate(const std::string& screenshot_path, const std::string& ver
 
 static void usage() {
   fprintf(stderr,
-          "usage: dumpstate [-h] [-b soundfile] [-e soundfile] [-o file [-d] [-p] "
-          "[-z]] [-s] [-S] [-q] [-B] [-P] [-R] [-V version]\n"
+          "usage: dumpstate [-h] [-b soundfile] [-e soundfile] [-o file [-d] [-p] [-t]"
+          "[-z] [-s] [-S] [-q] [-B] [-P] [-R] [-V version]\n"
           "  -h: display this help message\n"
           "  -b: play sound file instead of vibrate, at beginning of job\n"
           "  -e: play sound file instead of vibrate, at end of job\n"
           "  -o: write to file (instead of stdout)\n"
           "  -d: append date to filename (requires -o)\n"
           "  -p: capture screenshot to filename.png (requires -o)\n"
+          "  -t: only captures telephony sections\n"
           "  -z: generate zipped file (requires -o)\n"
           "  -s: write output to control socket (for init)\n"
           "  -S: write file location to control socket (for init; requires -o and -z)"
@@ -1041,6 +1329,8 @@ int main(int argc, char *argv[]) {
     int do_broadcast = 0;
     int do_early_screenshot = 0;
     int is_remote_mode = 0;
+    bool telephony_only = false;
+
     std::string version = VERSION_DEFAULT;
 
     now = time(NULL);
@@ -1062,10 +1352,18 @@ int main(int argc, char *argv[]) {
 
     /* set as high priority, and protect from OOM killer */
     setpriority(PRIO_PROCESS, 0, -20);
-    FILE *oom_adj = fopen("/proc/self/oom_adj", "we");
+
+    FILE *oom_adj = fopen("/proc/self/oom_score_adj", "we");
     if (oom_adj) {
-        fputs("-17", oom_adj);
+        fputs("-1000", oom_adj);
         fclose(oom_adj);
+    } else {
+        /* fallback to kernels <= 2.6.35 */
+        oom_adj = fopen("/proc/self/oom_adj", "we");
+        if (oom_adj) {
+            fputs("-17", oom_adj);
+            fclose(oom_adj);
+        }
     }
 
     /* parse arguments */
@@ -1073,9 +1371,10 @@ int main(int argc, char *argv[]) {
     format_args(argc, const_cast<const char **>(argv), &args);
     MYLOGD("Dumpstate command line: %s\n", args.c_str());
     int c;
-    while ((c = getopt(argc, argv, "dho:svqzpPBRSV:")) != -1) {
+    while ((c = getopt(argc, argv, "dho:svqzptPBRSV:")) != -1) {
         switch (c) {
             case 'd': do_add_date = 1;          break;
+            case 't': telephony_only = true;    break;
             case 'z': do_zip_file = 1;          break;
             case 'o': use_outfile = optarg;     break;
             case 's': use_socket = 1;           break;
@@ -1132,6 +1431,7 @@ int main(int argc, char *argv[]) {
     if (use_control_socket) {
         MYLOGD("Opening control socket\n");
         control_socket_fd = open_socket("dumpstate");
+        do_update_progress = 1;
     }
 
     /* full path of the temporary file containing the bugreport */
@@ -1171,6 +1471,9 @@ int main(int argc, char *argv[]) {
         char build_id[PROPERTY_VALUE_MAX];
         property_get("ro.build.id", build_id, "UNKNOWN_BUILD");
         base_name = base_name + "-" + build_id;
+        if (telephony_only) {
+            base_name = base_name + "-telephony";
+        }
         if (do_fb) {
             // TODO: if dumpstate was an object, the paths could be internal variables and then
             // we could have a function to calculate the derived values, such as:
@@ -1205,14 +1508,21 @@ int main(int argc, char *argv[]) {
         }
 
         if (do_update_progress) {
-            std::vector<std::string> am_args = {
-                 "--receiver-permission", "android.permission.DUMP", "--receiver-foreground",
-                 "--es", "android.intent.extra.NAME", suffix,
-                 "--ei", "android.intent.extra.ID", std::to_string(id),
-                 "--ei", "android.intent.extra.PID", std::to_string(getpid()),
-                 "--ei", "android.intent.extra.MAX", std::to_string(WEIGHT_TOTAL),
-            };
-            send_broadcast("android.intent.action.BUGREPORT_STARTED", am_args);
+            if (do_broadcast) {
+                // clang-format off
+                std::vector<std::string> am_args = {
+                     "--receiver-permission", "android.permission.DUMP", "--receiver-foreground",
+                     "--es", "android.intent.extra.NAME", suffix,
+                     "--ei", "android.intent.extra.ID", std::to_string(id),
+                     "--ei", "android.intent.extra.PID", std::to_string(getpid()),
+                     "--ei", "android.intent.extra.MAX", std::to_string(WEIGHT_TOTAL),
+                };
+                // clang-format on
+                send_broadcast("android.intent.action.BUGREPORT_STARTED", am_args);
+            }
+            if (use_control_socket) {
+                dprintf(control_socket_fd, "BEGIN:%s\n", path.c_str());
+            }
         }
     }
 
@@ -1273,30 +1583,59 @@ int main(int argc, char *argv[]) {
     // duration is logged into MYLOG instead.
     print_header(version);
 
-    // Dumps systrace right away, otherwise it will be filled with unnecessary events.
-    dump_systrace();
+    if (telephony_only) {
+        dump_iptables();
+        if (!drop_root_user()) {
+            return -1;
+        }
+        do_dmesg();
+        do_logcat();
+        do_kmsg();
+        dumpstate_board();
+        dump_modem_logs();
+    } else {
+        // Dumps systrace right away, otherwise it will be filled with unnecessary events.
+        // First try to dump anrd trace if the daemon is running. Otherwise, dump
+        // the raw trace.
+        if (!dump_anrd_trace()) {
+            dump_systrace();
+        }
 
-    // Invoking the following dumpsys calls before dump_traces() to try and
-    // keep the system stats as close to its initial state as possible.
-    run_command_as_shell("DUMPSYS MEMINFO", 30, "dumpsys", "-t", "30", "meminfo", "-a", NULL);
-    run_command_as_shell("DUMPSYS CPUINFO", 10, "dumpsys", "-t", "10", "cpuinfo", "-a", NULL);
+        // TODO: Drop root user and move into dumpstate() once b/28633932 is fixed.
+        dump_raft();
 
-    /* collect stack traces from Dalvik and native processes (needs root) */
-    dump_traces_path = dump_traces();
+        // Invoking the following dumpsys calls before dump_traces() to try and
+        // keep the system stats as close to its initial state as possible.
+        run_command_as_shell("DUMPSYS MEMINFO", 30, "dumpsys", "-t", "30", "meminfo", "-a", NULL);
+        run_command_as_shell("DUMPSYS CPUINFO", 10, "dumpsys", "-t", "10", "cpuinfo", "-a", NULL);
 
-    /* Run some operations that require root. */
-    get_tombstone_fds(tombstone_data);
-    add_dir(RECOVERY_DIR, true);
-    add_dir(RECOVERY_DATA_DIR, true);
-    add_dir(LOGPERSIST_DATA_DIR, false);
-    add_mountinfo();
-    dump_iptables();
+        /* collect stack traces from Dalvik and native processes (needs root) */
+        dump_traces_path = dump_traces();
 
-    if (!drop_root_user()) {
-        return -1;
+        /* Run some operations that require root. */
+        get_tombstone_fds(tombstone_data);
+        add_dir(RECOVERY_DIR, true);
+        add_dir(RECOVERY_DATA_DIR, true);
+        add_dir(LOGPERSIST_DATA_DIR, false);
+        if (!is_user_build()) {
+            add_dir(PROFILE_DATA_DIR_CUR, true);
+            add_dir(PROFILE_DATA_DIR_REF, true);
+        }
+        add_mountinfo();
+        dump_iptables();
+
+        // Capture any IPSec policies in play.  No keys are exposed here.
+        run_command("IP XFRM POLICY", 10, "ip", "xfrm", "policy", nullptr);
+
+        // Run ss as root so we can see socket marks.
+        run_command("DETAILED SOCKET STATE", 10, "ss", "-eionptu", NULL);
+
+        if (!drop_root_user()) {
+            return -1;
+        }
+
+        dumpstate(do_early_screenshot ? "": screenshot_path, version);
     }
-
-    dumpstate(do_early_screenshot ? "": screenshot_path, version);
 
     /* close output if needed */
     if (is_redirecting) {
@@ -1388,6 +1727,7 @@ int main(int argc, char *argv[]) {
     if (do_broadcast) {
         if (!path.empty()) {
             MYLOGI("Final bugreport path: %s\n", path.c_str());
+            // clang-format off
             std::vector<std::string> am_args = {
                  "--receiver-permission", "android.permission.DUMP", "--receiver-foreground",
                  "--ei", "android.intent.extra.ID", std::to_string(id),
@@ -1396,6 +1736,7 @@ int main(int argc, char *argv[]) {
                  "--es", "android.intent.extra.BUGREPORT", path,
                  "--es", "android.intent.extra.DUMPSTATE_LOG", log_path
             };
+            // clang-format on
             if (do_fb) {
                 am_args.push_back("--es");
                 am_args.push_back("android.intent.extra.SCREENSHOT");
@@ -1421,9 +1762,9 @@ int main(int argc, char *argv[]) {
         fclose(stderr);
     }
 
-    if (use_control_socket && control_socket_fd >= 0) {
-        MYLOGD("Closing control socket\n");
-        close(control_socket_fd);
+    if (use_control_socket && control_socket_fd != -1) {
+      MYLOGD("Closing control socket\n");
+      close(control_socket_fd);
     }
 
     return 0;
