@@ -91,13 +91,13 @@ static inline gralloc1_rect_t asGralloc1Rect(const Rect& rect) {
     return outRect;
 }
 
-status_t GraphicBufferMapper::lock(buffer_handle_t handle, uint32_t usage,
+status_t GraphicBufferMapper::lock(buffer_handle_t handle, int usage,
         const Rect& bounds, void** vaddr)
 {
     return lockAsync(handle, usage, bounds, vaddr, -1);
 }
 
-status_t GraphicBufferMapper::lockYCbCr(buffer_handle_t handle, uint32_t usage,
+status_t GraphicBufferMapper::lockYCbCr(buffer_handle_t handle, int usage,
         const Rect& bounds, android_ycbcr *ycbcr)
 {
     return lockAsyncYCbCr(handle, usage, bounds, ycbcr, -1);

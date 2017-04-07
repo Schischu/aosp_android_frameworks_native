@@ -422,8 +422,6 @@ public:
         return result;
     }
 
-<<<<<<< HEAD
-=======
     virtual bool getFrameTimestamps(uint64_t frameNumber,
                 FrameTimestamps* outTimestamps) const {
         Parcel data, reply;
@@ -460,7 +458,6 @@ public:
         return found;
     }
 
->>>>>>> 625227a788cefe42fac8a8e97f0bc7061b2ea109
     virtual status_t getUniqueId(uint64_t* outId) const {
         Parcel data, reply;
         data.writeInterfaceToken(IGraphicBufferProducer::getInterfaceDescriptor());
@@ -719,8 +716,6 @@ status_t BnGraphicBufferProducer::onTransact(
             }
             return NO_ERROR;
         }
-<<<<<<< HEAD
-=======
         case GET_FRAME_TIMESTAMPS: {
             CHECK_INTERFACE(IGraphicBufferProducer, data, reply);
             uint64_t frameNumber = 0;
@@ -745,7 +740,6 @@ status_t BnGraphicBufferProducer::onTransact(
             }
             return NO_ERROR;
         }
->>>>>>> 625227a788cefe42fac8a8e97f0bc7061b2ea109
         case GET_UNIQUE_ID: {
             CHECK_INTERFACE(IGraphicBufferProducer, data, reply);
             uint64_t outId = 0;

@@ -201,10 +201,10 @@ public:
     // immutable blobs if possible since they may be subsequently transferred between
     // processes without further copying whereas mutable blobs always need to be copied.
     // The caller should call release() on the blob after writing its contents.
-#if 1
+//+++>
     //Needed by drmserver and libdrmwvmplugin.so
     status_t            writeBlob(size_t len, WritableBlob* outBlob);
-#endif
+//--->
     status_t            writeBlob(size_t len, bool mutableCopy, WritableBlob* outBlob);
 
     // Write an existing immutable blob file descriptor to the parcel.

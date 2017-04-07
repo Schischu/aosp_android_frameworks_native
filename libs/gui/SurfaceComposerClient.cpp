@@ -880,7 +880,7 @@ status_t ScreenshotClient::update(const sp<IBinder>& display,
     status_t err = s->captureScreen(display, mProducer, sourceCrop,
             reqWidth, reqHeight, minLayerZ, maxLayerZ, useIdentityTransform,
 //+++>
-            static_cast<ISurfaceComposer::Rotation>(rotation), true);
+            static_cast<ISurfaceComposer::Rotation>(rotation), SS_CPU_CONSUMER);
 //===>
 //            static_cast<ISurfaceComposer::Rotation>(rotation));
 //--->
